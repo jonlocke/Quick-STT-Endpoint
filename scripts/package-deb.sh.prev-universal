@@ -1,0 +1,196 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+APP_NAME="whispercpp"
+APP_DIR="/opt/whispercpp"
+SERVICE_NAME="whispercpp.service"
+MAINTAINER="Holly Maintainers"
+DESCRIPTION="whisper.cpp GPU-enabled transcription server"
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+
+OUT_DIR="${OUT_DIR:-${REPO_ROOT}/dist}"
+VERSION="${VERSION:-}"
+ARCH="${ARCH:-amd64}"
+
+if [[ -z "${VERSION}" ]]; then
+  if git -C "${REPO_ROOT}" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    GIT_SHORT="$(git -C "${REPO_ROOT}" rev-parse --short HEAD)"
+  else
+    GIT_SHORT="local"
+  fi
+  VERSION="0.1.0+git$(date +%Y%m%d).${GIT_SHORT}"
+fi
+
+require_cmd() {
+  if ! command -v "$1" >/dev/null 2>&1; then
+    echo "Missing required command: $1" >&2
+    exit 1
+  fi
+}
+
+require_cmd dpkg-deb
+require_cmd cmake
+require_cmd make
+require_cmd python3
+
+WORK_ROOT="$(mktemp -d)"
+PKG_ROOT="${WORK_ROOT}/${APP_NAME}_${VERSION}"
+STAGE_ROOT="${PKG_ROOT}"
+DEBIAN_DIR="${STAGE_ROOT}/DEBIAN"
+APP_STAGE_DIR="${STAGE_ROOT}${APP_DIR}"
+
+cleanup() {
+  rm -rf "${WORK_ROOT}"
+}
+trap cleanup EXIT
+
+mkdir -p "${DEBIAN_DIR}" "${APP_STAGE_DIR}" "${STAGE_ROOT}/lib/systemd/system" "${STAGE_ROOT}/etc/whispercpp" "${STAGE_ROOT}/usr/local/bin"
+
+# Build whisper-server
+cmake -S "${REPO_ROOT}" -B "${REPO_ROOT}/build" -DWHISPER_BUILD_SERVER=ON -DGGML_VULKAN=ON -DCMAKE_BUILD_TYPE=Release
+JOBS="${JOBS:-2}"
+cmake --build "${REPO_ROOT}/build" --target whisper-server -j"${JOBS}"
+
+# Copy minimal runtime payload
+install -m 0755 "${REPO_ROOT}/build/bin/whisper-server" "${APP_STAGE_DIR}/whisper-server"
+install -m 0644 "${REPO_ROOT}/README.md" "${APP_STAGE_DIR}/README.md"
+install -m 0644 "${REPO_ROOT}/LICENSE" "${APP_STAGE_DIR}/LICENSE"
+mkdir -p "${APP_STAGE_DIR}/models"
+if [[ -f "${REPO_ROOT}/models/ggml-base.en.bin" ]]; then
+  install -m 0644 "${REPO_ROOT}/models/ggml-base.en.bin" "${APP_STAGE_DIR}/models/ggml-base.en.bin"
+fi
+
+cat > "${STAGE_ROOT}/etc/whispercpp/whispercpp.env" <<'ENVFILE'
+WHISPER_MODEL=/opt/whispercpp/models/ggml-base.en.bin
+WHISPER_HOST=0.0.0.0
+WHISPER_PORT=9000
+WHISPER_THREADS=4
+WHISPER_LANGUAGE=en
+WHISPER_EXTRA_ARGS=--flash-attn --best-of 1 --beam-size 1 --no-timestamps
+ENVFILE
+
+cat > "${STAGE_ROOT}/usr/local/bin/whispercpp-server" <<'LAUNCHER'
+#!/usr/bin/env bash
+set -euo pipefail
+source /etc/whispercpp/whispercpp.env
+exec /opt/whispercpp/whisper-server \
+  --host "${WHISPER_HOST}" \
+  --port "${WHISPER_PORT}" \
+  --model "${WHISPER_MODEL}" \
+  --threads "${WHISPER_THREADS}" \
+  --language "${WHISPER_LANGUAGE}" \
+  ${WHISPER_EXTRA_ARGS}
+LAUNCHER
+chmod 0755 "${STAGE_ROOT}/usr/local/bin/whispercpp-server"
+
+cat > "${STAGE_ROOT}/lib/systemd/system/${SERVICE_NAME}" <<'UNIT'
+[Unit]
+Description=whisper.cpp GPU-enabled transcription server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=whispercpp
+Group=whispercpp
+WorkingDirectory=/opt/whispercpp
+EnvironmentFile=/etc/whispercpp/whispercpp.env
+ExecStart=/usr/local/bin/whispercpp-server
+Restart=on-failure
+RestartSec=3
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=read-only
+ReadWritePaths=/tmp /var/tmp /opt/whispercpp
+LimitNOFILE=65535
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+
+INSTALLED_SIZE="$(du -sk "${STAGE_ROOT}" | awk '{print $1}')"
+
+cat > "${DEBIAN_DIR}/control" <<CONTROL
+Package: ${APP_NAME}
+Version: ${VERSION}
+Section: sound
+Priority: optional
+Architecture: ${ARCH}
+Maintainer: ${MAINTAINER}
+Depends: systemd
+Installed-Size: ${INSTALLED_SIZE}
+Description: ${DESCRIPTION}
+ Local whisper.cpp GPU-enabled server as a systemd service.
+CONTROL
+
+cat > "${DEBIAN_DIR}/conffiles" <<CONFFILES
+/etc/whispercpp/whispercpp.env
+CONFFILES
+
+cat > "${DEBIAN_DIR}/postinst" <<'POSTINST'
+#!/usr/bin/env bash
+set -e
+
+SERVICE_NAME="whispercpp.service"
+APP_DIR="/opt/whispercpp"
+
+if ! id -u whispercpp >/dev/null 2>&1; then
+  adduser --system --group --home /var/lib/whispercpp --no-create-home whispercpp
+fi
+
+install -d -o whispercpp -g whispercpp /var/lib/whispercpp /var/log/whispercpp
+chown -R whispercpp:whispercpp "${APP_DIR}" || true
+
+if command -v systemctl >/dev/null 2>&1; then
+  systemctl daemon-reload || true
+  if [[ "$1" == "configure" ]]; then
+    systemctl enable "${SERVICE_NAME}" >/dev/null 2>&1 || true
+    if ! systemctl try-restart "${SERVICE_NAME}" >/dev/null 2>&1; then
+      systemctl start "${SERVICE_NAME}" >/dev/null 2>&1 || true
+    fi
+  fi
+fi
+
+# Add firewall rule for port 9000 if UFW is active and no 9000/tcp allow rule exists
+if command -v ufw >/dev/null 2>&1; then
+  if ufw status | grep -q "Status: active"; then
+    if ! ufw status | grep -E -q "9000/tcp\s+ALLOW IN"; then
+      ufw allow 9000/tcp >/dev/null 2>&1 || true
+    fi
+  fi
+fi
+
+echo "whispercpp installed."
+echo "Config: /etc/whispercpp/whispercpp.env"
+POSTINST
+
+cat > "${DEBIAN_DIR}/prerm" <<'PRERM'
+#!/usr/bin/env bash
+set -e
+SERVICE_NAME="whispercpp.service"
+if command -v systemctl >/dev/null 2>&1; then
+  systemctl stop "${SERVICE_NAME}" >/dev/null 2>&1 || true
+  systemctl disable "${SERVICE_NAME}" >/dev/null 2>&1 || true
+fi
+PRERM
+
+cat > "${DEBIAN_DIR}/postrm" <<'POSTRM'
+#!/usr/bin/env bash
+set -e
+SERVICE_NAME="whispercpp.service"
+if command -v systemctl >/dev/null 2>&1; then
+  systemctl daemon-reload || true
+  systemctl reset-failed "${SERVICE_NAME}" >/dev/null 2>&1 || true
+fi
+POSTRM
+
+chmod 0755 "${DEBIAN_DIR}/postinst" "${DEBIAN_DIR}/prerm" "${DEBIAN_DIR}/postrm"
+
+mkdir -p "${OUT_DIR}"
+DEB_PATH="${OUT_DIR}/${APP_NAME}_${VERSION}_${ARCH}.deb"
+dpkg-deb --build --root-owner-group "${STAGE_ROOT}" "${DEB_PATH}" >/dev/null
+
+echo "Built package: ${DEB_PATH}"
